@@ -8,7 +8,7 @@ from typing import Optional
 
 import joblib
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -33,10 +33,18 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True,            # ok with explicit origins (not "*")
+    allow_methods=["POST", "OPTIONS"], # be explicit for some proxies
+    allow_headers=["Content-Type", "Accept"],
+    max_age=600,
 )
+
+# Extra safety: explicitly serve preflight with CORS headers on this path
+@app.options("/predict_price")
+def options_predict_price():
+    # FastAPI's CORSMiddleware should add headers automatically,
+    # but returning 200 here removes any ambiguity/proxy weirdness.
+    return Response(status_code=200)
 
 # ===== Schemas =====
 class TripRequest(BaseModel):
@@ -56,7 +64,6 @@ kmeans = joblib.load("kmeans_model.joblib")
 
 # A tiny fast date parser for "YYYY-MM-DD" (fallback to fromisoformat)
 def _parse_date(s: str) -> date:
-    # fast path for 'YYYY-MM-DD'
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         y = int(s[0:4]); m = int(s[5:7]); d = int(s[8:10])
         return date(y, m, d)
@@ -64,13 +71,11 @@ def _parse_date(s: str) -> date:
 
 @lru_cache(maxsize=1024)
 def _loc_cluster(lat_rounded: int, lon_rounded: int) -> int:
-    # use rounded coords as cache key to dedupe repeated resorts
     lat = lat_rounded / 1_000_000
     lon = lon_rounded / 1_000_000
     return int(kmeans.predict([[lat, lon]])[0])
 
 def _is_holiday(month: int, day: int) -> int:
-    # keep logic tiny & branchless-ish
     return 1 if (month == 12 and 20 <= day <= 31) else 0
 
 def predict_one(trip: TripRequest, *, now_date: Optional[date] = None) -> Optional[float]:
@@ -88,12 +93,10 @@ def predict_one(trip: TripRequest, *, now_date: Optional[date] = None) -> Option
         days_until_checkin = (check_in_d - nd).days
         is_holiday = _is_holiday(month, check_in_d.day)
 
-        # cache KMeans per rounded lat/lon to avoid repeated predictions
         lat_i = int(round(trip.lat * 1_000_000))
         lon_i = int(round(trip.lon * 1_000_000))
         location_cluster = _loc_cluster(lat_i, lon_i)
 
-        # Keep as numpy array for very small overhead
         X = np.array([[
             trip.lat,
             trip.lon,
@@ -125,7 +128,6 @@ def health():
 
 @app.post("/predict_price", response_model=PredictPriceResponse)
 def predict_price(trip: TripRequest):
-    # use a consistent "now" so repeated calls in a burst are stable
     price = predict_one(trip, now_date=datetime.now().date())
     return PredictPriceResponse(predicted_price=price)
 
@@ -151,5 +153,4 @@ def _warmup():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    # For local testing, 1 worker is usually fastest on small laptops
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True, log_level="warning")
